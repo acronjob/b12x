@@ -20,6 +20,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import (
+    ld_global_cg_v4_u32,
     ld_global_v4_u32,
     st_global_v4_f32,
     st_global_v4_u32,
@@ -37,6 +38,7 @@ from ._cute_intrinsics import (
     pack_f32x2_to_bf16x2,
     pack_f32x2_to_f16x2,
     pcie_arrive_and_wait,
+    pcie_arrive_and_wait_acquire,
     rsqrt_approx_f32,
     spin_until_changed_acquire_gpu,
     st_global_f32,
@@ -109,6 +111,35 @@ class _PackedMath:
                     accumulator[lane + 1] = accumulator[lane + 1] + hi
 
     @cute.jit
+    def _load_accumulate_cg(
+        self,
+        accumulator: cute.Tensor,
+        address: Int64,
+        initialize: cutlass.Constexpr[bool],
+    ) -> None:
+        words = ld_global_cg_v4_u32(address)
+        if cutlass.const_expr(self._dtype_name == "float32"):
+            for word in cutlass.range_constexpr(4):
+                value = u32_as_f32(words[word])
+                if cutlass.const_expr(initialize):
+                    accumulator[word] = value
+                else:
+                    accumulator[word] = accumulator[word] + value
+        else:
+            for word in cutlass.range_constexpr(4):
+                if cutlass.const_expr(self._dtype_name == "float16"):
+                    lo, hi = unpack_f16x2(words[word])
+                else:
+                    lo, hi = unpack_bf16x2(words[word])
+                lane = word * 2
+                if cutlass.const_expr(initialize):
+                    accumulator[lane] = lo
+                    accumulator[lane + 1] = hi
+                else:
+                    accumulator[lane] = accumulator[lane] + lo
+                    accumulator[lane + 1] = accumulator[lane + 1] + hi
+
+    @cute.jit
     def _store_accumulator(self, address: Int64, accumulator: cute.Tensor) -> None:
         if cutlass.const_expr(self._dtype_name == "float32"):
             st_global_v4_f32(
@@ -150,14 +181,20 @@ class _OneshotLaunch(_PackedMath):
         dtype_name: str,
         world_size: int,
         rank: int,
+        mode: str,
         stage_input: bool,
         device_slot_selection: bool,
         slot_bias: int,
         threads: int,
     ) -> None:
         super().__init__(dtype_name)
+        if mode not in ("registered", "stage_pull", "stage_remote_push"):
+            raise ValueError(f"invalid plain oneshot mode {mode!r}")
+        if mode == "stage_remote_push" and world_size != 4:
+            raise ValueError("plain remote push requires TP4")
         self._world_size = int(world_size)
         self._rank = int(rank)
+        self._mode = mode
         self._stage_input = bool(stage_input)
         self._device_slot_selection = bool(device_slot_selection)
         self._slot_bias = int(slot_bias) & 1
@@ -171,6 +208,7 @@ class _OneshotLaunch(_PackedMath):
         input_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         size_packs: Int32,
+        shard_packs: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -180,6 +218,7 @@ class _OneshotLaunch(_PackedMath):
             input_ptr,
             output_ptr,
             size_packs,
+            shard_packs,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -217,12 +256,20 @@ class _OneshotLaunch(_PackedMath):
                 )
                 * Int64(4)
             )
-            pcie_arrive_and_wait(
-                self_counter,
-                peer_slot0,
-                wait_slot0,
-                Int64(_PEER_SLOT_BYTES),
-            )
+            if cutlass.const_expr(self._mode == "stage_remote_push"):
+                pcie_arrive_and_wait_acquire(
+                    self_counter,
+                    peer_slot0,
+                    wait_slot0,
+                    Int64(_PEER_SLOT_BYTES),
+                )
+            else:
+                pcie_arrive_and_wait(
+                    self_counter,
+                    peer_slot0,
+                    wait_slot0,
+                    Int64(_PEER_SLOT_BYTES),
+                )
         cute.arch.sync_threads()
 
     @cute.kernel
@@ -233,6 +280,7 @@ class _OneshotLaunch(_PackedMath):
         input_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         size_packs: Int32,
+        shard_packs: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -251,27 +299,60 @@ class _OneshotLaunch(_PackedMath):
         index = Int32(bidx) * Int32(self._threads) + Int32(tidx)
         stride = Int32(gdim) * Int32(self._threads)
         if cutlass.const_expr(self._stage_input):
-            staging_base = Int64(peer_ptrs[self._rank])
             stage_index = index
             while stage_index < size_packs:
-                self._copy_pack(
-                    input_base + Int64(stage_index) * Int64(16),
-                    staging_base + Int64(stage_index) * Int64(16),
-                )
+                if cutlass.const_expr(self._mode == "stage_remote_push"):
+                    source = input_base + Int64(stage_index) * Int64(16)
+                    words = ld_global_v4_u32(source)
+                    for peer_index in cutlass.range_constexpr(1, self._world_size):
+                        destination_rank = (self._rank + peer_index) % self._world_size
+                        destination = Int64(peer_ptrs[destination_rank]) + (
+                            Int64(self._rank) * shard_packs + Int64(stage_index)
+                        ) * Int64(16)
+                        st_global_v4_u32(
+                            destination,
+                            words[0],
+                            words[1],
+                            words[2],
+                            words[3],
+                        )
+                else:
+                    staging_base = Int64(peer_ptrs[self._rank])
+                    self._copy_pack(
+                        input_base + Int64(stage_index) * Int64(16),
+                        staging_base + Int64(stage_index) * Int64(16),
+                    )
                 stage_index += stride
 
         self._multi_gpu_barrier(signal_ptrs)
 
         while index < size_packs:
             accumulator = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
-            for peer_index in cutlass.range_constexpr(self._world_size):
-                peer_rank = (self._rank + peer_index) % self._world_size
-                peer_base = Int64(peer_ptrs[peer_rank])
+            if cutlass.const_expr(self._mode == "stage_remote_push"):
                 self._load_accumulate(
                     accumulator,
-                    peer_base + Int64(index) * Int64(16),
-                    peer_index == 0,
+                    input_base + Int64(index) * Int64(16),
+                    True,
                 )
+                local_stage = Int64(peer_ptrs[self._rank])
+                for peer_index in cutlass.range_constexpr(1, self._world_size):
+                    source_rank = (self._rank + peer_index) % self._world_size
+                    self._load_accumulate_cg(
+                        accumulator,
+                        local_stage
+                        + (Int64(source_rank) * shard_packs + Int64(index))
+                        * Int64(16),
+                        False,
+                    )
+            else:
+                for peer_index in cutlass.range_constexpr(self._world_size):
+                    peer_rank = (self._rank + peer_index) % self._world_size
+                    peer_base = Int64(peer_ptrs[peer_rank])
+                    self._load_accumulate(
+                        accumulator,
+                        peer_base + Int64(index) * Int64(16),
+                        peer_index == 0,
+                    )
             self._store_accumulator(output_base + Int64(index) * Int64(16), accumulator)
             index += stride
 
@@ -954,6 +1035,7 @@ def _oneshot_process_key(
     dtype_name: str,
     world_size: int,
     rank: int,
+    mode: str,
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
@@ -964,6 +1046,7 @@ def _oneshot_process_key(
         str(dtype_name),
         int(world_size),
         int(rank),
+        str(mode),
         bool(stage_input),
         bool(device_slot_selection),
         int(slot_bias) & 1 if device_slot_selection else 0,
@@ -976,6 +1059,7 @@ def is_oneshot_launcher_prepared(
     dtype_name: str,
     world_size: int,
     rank: int,
+    mode: str,
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
@@ -989,6 +1073,7 @@ def is_oneshot_launcher_prepared(
             dtype_name,
             world_size,
             rank,
+            mode,
             stage_input,
             device_slot_selection,
             slot_bias,
@@ -1004,6 +1089,7 @@ def get_oneshot_launcher(
     dtype_name: str,
     world_size: int,
     rank: int,
+    mode: str,
     stage_input: bool,
     device_slot_selection: bool,
     slot_bias: int,
@@ -1014,6 +1100,7 @@ def get_oneshot_launcher(
         dtype_name,
         world_size,
         rank,
+        mode,
         stage_input,
         device_slot_selection,
         slot_bias,
@@ -1026,6 +1113,7 @@ def get_oneshot_launcher(
         dtype_name,
         world_size,
         rank,
+        mode,
         stage_input,
         device_slot_selection,
         slot_bias,
@@ -1035,6 +1123,7 @@ def get_oneshot_launcher(
         dtype_name,
         int(world_size),
         int(rank),
+        str(mode),
         bool(stage_input),
         bool(device_slot_selection),
         slot_bias,
@@ -1051,8 +1140,9 @@ def get_oneshot_launcher(
         _dummy(cutlass.Uint32, 16),
         1,
         1,
+        1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 1, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 2, cache_key),
     )
 
     def run(
@@ -1061,6 +1151,7 @@ def get_oneshot_launcher(
         input_address: int,
         output_address: int,
         size_packs: int,
+        shard_packs: int,
         grid_x: int,
     ) -> None:
         raw(
@@ -1089,6 +1180,7 @@ def get_oneshot_launcher(
                 assumed_align=16,
             ),
             int(size_packs),
+            int(shard_packs),
             int(grid_x),
             current_cuda_stream(),
         )
