@@ -40,10 +40,13 @@ from b12x._lib.intrinsics import (
     tf32_mma_m16n8k8_f32,
 )
 from b12x._lib.utils import current_cuda_stream
+from b12x.norm.mhc._policy import MhcConfig
 
 _MHC_MULT = 4
 _TOKENS = 1
 _HIDDEN = 4096
+# SM120 decode graphs use the four-way source split from this many padded rows.
+_SM120_DECODE_SPLIT_MIN_TOKENS = 32
 _TOTAL_K = _MHC_MULT * _HIDDEN
 _SPLIT_K = 64
 _SOURCE_TILE_H = 128
@@ -450,12 +453,29 @@ def _selected_post_pre_decode_split_n(
     else:
         if compute_capability is None and torch.cuda.is_available():
             compute_capability = tuple(torch.cuda.get_device_capability())
-        if compute_capability != (12, 1) or int(hidden_size) != _HIDDEN:
+        if int(hidden_size) != _HIDDEN:
             return 0, 0
-        if int(num_tokens) >= 10:
-            splits, tile_n = 8, 6
-        elif int(num_tokens) >= 8:
-            splits, tile_n = 4, 6
+        if compute_capability == (12, 1):
+            if int(num_tokens) >= 10:
+                splits, tile_n = 8, 6
+            elif int(num_tokens) >= 8:
+                splits, tile_n = 4, 6
+            else:
+                return 0, 0
+        elif compute_capability == (12, 0):
+            # RTX PRO 6000 Blackwell (SM120), measured 2026-09-01 on GLM-5.3
+            # decode graphs (hidden size 4096): the four-way source split is
+            # 19-24% faster from 32 padded rows up (32 rows 20.2 -> 16.4 us,
+            # 64 rows 35.1 -> 26.7, 96 rows 43.0 -> 33.3, 128 rows 44.8 ->
+            # 41.0) while at 8-16 rows the unsplit kernel is faster in-graph.
+            # The residual update is bitwise identical to the unsplit kernel;
+            # the fn partials are reduced over four source splits, so the
+            # gate/mix values differ by fp32 rounding (at most a few ulp) and
+            # y by at most one bf16 ulp.
+            if int(num_tokens) >= _SM120_DECODE_SPLIT_MIN_TOKENS:
+                splits, tile_n = 4, 6
+            else:
+                return 0, 0
         else:
             return 0, 0
     if splits <= 0 or splits > _SOURCE_TILES or int(hidden_size) % splits != 0:
@@ -520,6 +540,7 @@ def _selected_post_pre_partials_per_cta(
     num_tokens: int,
     hidden_size: int,
     compute_capability: tuple[int, int] | None = None,
+    schedule: str = "default",
 ) -> int:
     raw = os.environ.get("B12X_MHC_PARTIALS_PER_CTA")
     if raw is not None and raw != "":
@@ -529,6 +550,28 @@ def _selected_post_pre_partials_per_cta(
             raise ValueError(
                 f"invalid B12X_MHC_PARTIALS_PER_CTA={raw!r}"
             ) from exc
+
+    if schedule == "hidden4096_m128_v1":
+        if int(hidden_size) != _HIDDEN:
+            raise ValueError(
+                "hidden4096_m128_v1 requires hidden_size=4096"
+            )
+        tokens = int(num_tokens)
+        if tokens >= 96:
+            return _POST_PRE_PARTIALS_PER_CTA
+        if tokens >= 24:
+            return 13
+        if tokens >= 16:
+            return 7
+        if tokens >= 8:
+            return 5
+        if tokens >= 4:
+            return 3
+        if tokens >= 2:
+            return 2
+        return 1
+    if schedule != "default":
+        raise ValueError(f"unsupported mHC decode partials schedule {schedule!r}")
 
     if compute_capability is None and torch.cuda.is_available():
         compute_capability = tuple(torch.cuda.get_device_capability())
@@ -808,6 +851,7 @@ class MHCPostPrePartialKernel:
             ),
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -823,6 +867,8 @@ class MHCPostPrePartialKernel:
     ):
         hidden_tile, partial_group, token = cute.arch.block_idx()
         tidx = cute.arch.thread_idx()[0]
+        if const_expr(_MHC_PDL):
+            cute.arch.griddepcontrol_wait()
         lane = tidx % Int32(32)
         warp = tidx // Int32(32)
         nwarps = self.num_threads // 32
@@ -2507,13 +2553,46 @@ class MHCPrefillTf32ProjectTmaKernel:
         *,
         hidden_size: int = _HIDDEN,
         split_k: int | None = None,
+        tile_m: int | None = None,
+        tile_n: int | None = None,
+        tile_k: int | None = None,
+        num_stages: int | None = None,
+        num_m_warps: int | None = None,
+        num_n_warps: int | None = None,
+        k_splits: int | None = None,
         chunk_geometry: bool = False,
         long_geometry: bool = False,
     ):
         self.hidden_size = int(hidden_size)
         use_4096_chunk_geometry = chunk_geometry and self.hidden_size == _HIDDEN
         use_4096_long_geometry = long_geometry and self.hidden_size == _HIDDEN
-        if use_4096_long_geometry:
+        explicit_geometry = (
+            tile_m,
+            tile_n,
+            tile_k,
+            num_stages,
+            num_m_warps,
+            num_n_warps,
+            k_splits,
+        )
+        if any(value is not None for value in explicit_geometry):
+            if not all(value is not None for value in explicit_geometry):
+                raise ValueError("explicit TF32 projection geometry must be complete")
+            assert tile_m is not None
+            assert tile_n is not None
+            assert tile_k is not None
+            assert num_stages is not None
+            assert num_m_warps is not None
+            assert num_n_warps is not None
+            assert k_splits is not None
+            self.tile_m = int(tile_m)
+            self.tile_n = int(tile_n)
+            self.tile_k = int(tile_k)
+            self.num_stages = int(num_stages)
+            self.num_m_warps = int(num_m_warps)
+            self.num_n_warps = int(num_n_warps)
+            self.k_splits = int(k_splits)
+        elif use_4096_long_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_LONG_4096_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_LONG_4096_N_WARPS
             self.tile_m = _PREFILL_TF32_TMA_LONG_4096_TILE_M
@@ -3949,14 +4028,24 @@ def _prefill_bf16_project_tma_kernel(
 def _prefill_tf32_project_kernel(
     hidden_size: int,
     split_k: int,
-    chunk_geometry: bool = False,
-    long_geometry: bool = False,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_stages: int,
+    num_m_warps: int,
+    num_n_warps: int,
+    k_splits: int,
 ) -> MHCPrefillTf32ProjectTmaKernel:
     return MHCPrefillTf32ProjectTmaKernel(
         hidden_size=hidden_size,
         split_k=split_k,
-        chunk_geometry=chunk_geometry,
-        long_geometry=long_geometry,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_stages=num_stages,
+        num_m_warps=num_m_warps,
+        num_n_warps=num_n_warps,
+        k_splits=k_splits,
     )
 
 
@@ -4003,6 +4092,7 @@ def _run_mhc_post_pre_partial_launch(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    partials_per_cta: int = 0,
 ) -> None:
     tokens = int(x.shape[0])
     hidden_size = int(residual.shape[2])
@@ -4018,9 +4108,13 @@ def _run_mhc_post_pre_partial_launch(
         if raw_bf16x2 is not None
         else tokens == 16 and hidden_size == _HIDDEN and decode_source_splits > 0
     )
-    partials_per_cta = _selected_post_pre_partials_per_cta(
-        num_tokens=tokens,
-        hidden_size=hidden_size,
+    partials_per_cta = (
+        _validate_post_pre_partials_per_cta(int(partials_per_cta))
+        if int(partials_per_cta) > 0
+        else _selected_post_pre_partials_per_cta(
+            num_tokens=tokens,
+            hidden_size=hidden_size,
+        )
     )
     _validate_tensor_shape("x", x, (tokens, hidden_size))
     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
@@ -4200,6 +4294,7 @@ def _mhc_post_pre_partial_launch_op(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     _run_mhc_post_pre_partial_launch(
         x=x,
@@ -4210,6 +4305,7 @@ def _mhc_post_pre_partial_launch_op(
         partials=partials,
         out=out,
         compute_gram=compute_gram,
+        partials_per_cta=partials_per_cta,
     )
 
 
@@ -4223,6 +4319,7 @@ def _mhc_post_pre_partial_launch_fake(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool,
+    partials_per_cta: int,
 ) -> None:
     return None
 
@@ -4237,7 +4334,13 @@ def run_mhc_post_pre_partial(
     partials: torch.Tensor,
     out: torch.Tensor,
     compute_gram: bool = False,
+    decode_partials_schedule: str = "default",
 ) -> None:
+    partials_per_cta = _selected_post_pre_partials_per_cta(
+        num_tokens=int(x.shape[0]),
+        hidden_size=int(residual.shape[2]),
+        schedule=decode_partials_schedule,
+    )
     torch.ops.b12x.mhc_post_pre_partial_launch(
         x,
         residual,
@@ -4247,6 +4350,7 @@ def run_mhc_post_pre_partial(
         partials,
         out,
         bool(compute_gram),
+        int(partials_per_cta),
     )
 
 
@@ -4999,6 +5103,13 @@ def _run_mhc_prefill_tf32_project_launch(
     out: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_stages: int,
+    num_m_warps: int,
+    num_n_warps: int,
+    k_splits: int,
 ) -> None:
     tokens = int(out.shape[0])
     hidden_size = int(out.shape[2])
@@ -5018,15 +5129,16 @@ def _run_mhc_prefill_tf32_project_launch(
     if not fn.is_contiguous():
         raise ValueError("fn must be contiguous")
     out_flat = out.view(tokens, _MHC_MULT * hidden_size)
-    chunk_geometry = tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
-    long_geometry = (
-        hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
-    )
     kernel = _prefill_tf32_project_kernel(
         hidden_size,
         split_k,
-        chunk_geometry,
-        long_geometry,
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        int(num_stages),
+        int(num_m_warps),
+        int(num_n_warps),
+        int(k_splits),
     )
     args = (
         _to_kernel_tensor(out_flat, cutlass.BFloat16, dynamic_layout=True),
@@ -5064,15 +5176,12 @@ def _run_mhc_prefill_tf32_project_launch(
     hidden_specialization = _hidden_specialization_name(hidden_size)
     compile_name = (
         "integration.residual.mhc_prefill_tf32_project_tma_"
-        f"{hidden_specialization}_m{kernel.tile_m}_n{kernel.tile_n}"
+        f"{hidden_specialization}_m{kernel.tile_m}_n{kernel.tile_n}_"
+        f"k{kernel.tile_k}_s{kernel.num_stages}_ks{kernel.k_splits}"
     )
     compile_key = (
         ("hidden_size", hidden_size),
         ("split_k", split_k),
-        ("chunk_geometry", chunk_geometry),
-        ("chunk_min_tokens", _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS),
-        ("long_geometry", long_geometry),
-        ("long_min_tokens", _PREFILL_TF32_TMA_LONG_MIN_TOKENS),
         ("tile_m", kernel.tile_m),
         ("tile_n", kernel.tile_n),
         ("tile_k", kernel.tile_k),
@@ -5091,24 +5200,52 @@ def _run_mhc_prefill_tf32_project_launch(
     )
     b12x_launch(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(compile_name, 6, compile_key),
+        compile_spec=KernelCompileSpec.from_key(compile_name, 7, compile_key),
         compile_args=args,
         runtime_args=args,
     )
 
 
-def mhc_prefill_tf32_project_splits(*, tokens: int, hidden_size: int) -> int:
-    """Return the projection split count selected by the TF32 prefill kernel."""
-    chunk_geometry = int(tokens) >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS
-    long_geometry = (
-        int(hidden_size) == _HIDDEN and int(tokens) >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS
+def _legacy_mhc_prefill_tf32_config(
+    *,
+    tokens: int,
+    hidden_size: int,
+) -> MhcConfig:
+    if hidden_size == _HIDDEN and tokens >= _PREFILL_TF32_TMA_LONG_MIN_TOKENS:
+        geometry = (128, 24, 64, 2, 8, 1, 4)
+    elif hidden_size == _HIDDEN and tokens >= 3_584:
+        geometry = (192, 24, 64, 2, 12, 1, 8)
+    elif hidden_size == _HIDDEN and tokens >= 2_304:
+        geometry = (64, 24, 64, 2 if tokens >= 3_072 else 3, 4, 1, 8)
+    elif tokens >= _PREFILL_TF32_TMA_CHUNK_MIN_TOKENS:
+        geometry = (32, 8, 256, 1, 2, 1, 1)
+    else:
+        geometry = (16, 8, 256, 1, 1, 1, 1)
+    return MhcConfig(
+        backend="tf32_tma",
+        decode_partials_schedule="default",
+        projection_tile_m=geometry[0],
+        projection_tile_n=geometry[1],
+        projection_tile_k=geometry[2],
+        projection_num_stages=geometry[3],
+        projection_num_m_warps=geometry[4],
+        projection_num_n_warps=geometry[5],
+        projection_k_splits=geometry[6],
     )
-    return _prefill_tf32_project_kernel(
-        int(hidden_size),
-        _split_k_for_hidden(int(hidden_size)),
-        chunk_geometry,
-        long_geometry,
-    ).k_splits
+
+
+def mhc_prefill_tf32_project_splits(
+    *,
+    tokens: int,
+    hidden_size: int,
+    config: MhcConfig | None = None,
+) -> int:
+    """Return the projection split count selected by the TF32 prefill kernel."""
+    selected = config or _legacy_mhc_prefill_tf32_config(
+        tokens=int(tokens),
+        hidden_size=int(hidden_size),
+    )
+    return selected.projection_k_splits
 
 
 @torch.library.custom_op(
@@ -5119,11 +5256,25 @@ def _mhc_prefill_tf32_project_launch_op(
     out: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_stages: int,
+    num_m_warps: int,
+    num_n_warps: int,
+    k_splits: int,
 ) -> None:
     _run_mhc_prefill_tf32_project_launch(
         out=out,
         fn=fn,
         partials=partials,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_stages=num_stages,
+        num_m_warps=num_m_warps,
+        num_n_warps=num_n_warps,
+        k_splits=k_splits,
     )
 
 
@@ -5132,7 +5283,26 @@ def _mhc_prefill_tf32_project_launch_fake(
     out: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_stages: int,
+    num_m_warps: int,
+    num_n_warps: int,
+    k_splits: int,
 ) -> None:
+    del (
+        out,
+        fn,
+        partials,
+        tile_m,
+        tile_n,
+        tile_k,
+        num_stages,
+        num_m_warps,
+        num_n_warps,
+        k_splits,
+    )
     return None
 
 
@@ -5141,11 +5311,23 @@ def run_mhc_prefill_tf32_project(
     out: torch.Tensor,
     fn: torch.Tensor,
     partials: torch.Tensor,
+    config: MhcConfig | None = None,
 ) -> None:
+    selected = config or _legacy_mhc_prefill_tf32_config(
+        tokens=int(out.shape[0]),
+        hidden_size=int(out.shape[2]),
+    )
     torch.ops.b12x.mhc_prefill_tf32_project_launch(
         out,
         fn,
         partials,
+        selected.projection_tile_m,
+        selected.projection_tile_n,
+        selected.projection_tile_k,
+        selected.projection_num_stages,
+        selected.projection_num_m_warps,
+        selected.projection_num_n_warps,
+        selected.projection_k_splits,
     )
 
 

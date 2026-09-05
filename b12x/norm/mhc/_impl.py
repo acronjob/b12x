@@ -2,24 +2,27 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
 
+from b12x._lib.scratch import (
+    ScratchBufferSpec,
+    scratch_buffer_spec,
+    scratch_tensor,
+)
 from b12x._lib.scratch_layout import (
     SCRATCH_ALIGN_BYTES,
     align_up,
     dtype_nbytes,
     materialize_scratch_view,
 )
-from b12x._lib.scratch import (
-    ScratchBufferSpec,
-    scratch_buffer_spec,
-    scratch_tensor,
-)
+from b12x.policy import PolicyContext, get_auto_policy
 
+from ._policy import MHC_POLICY, MhcConfig, MhcQuery
 
 MHC_MULT = 4
 MHC_MIXES = (2 + MHC_MULT) * MHC_MULT
@@ -70,6 +73,7 @@ def _supports_mhc_post_hidden(hidden_size: int) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class B12XMHCBinding:
+    plan: "B12XMHCScratchPlan"
     partials: torch.Tensor | None = None
     y: torch.Tensor | None = None
     post_buffer: torch.Tensor | None = None
@@ -182,6 +186,8 @@ class B12XMHCScratchPlan:
     caps: B12XMHCScratchCaps
     layout: _MHCScratchLayout
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    config: MhcConfig
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -244,6 +250,7 @@ class B12XMHCScratchPlan:
             device=self.caps.device,
         )
         return B12XMHCBinding(
+            plan=self,
             partials=partials,
             y=y,
             post_buffer=post,
@@ -441,7 +448,26 @@ def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
     )
 
 
-def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
+def plan_mhc_scratch(
+    caps: B12XMHCScratchCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> B12XMHCScratchPlan:
+    if not isinstance(caps, B12XMHCScratchCaps):
+        raise TypeError("caps must be B12XMHCScratchCaps")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        MHC_POLICY,
+        MhcQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            hidden_size=caps.hidden_size,
+            split_k=caps.split_k,
+        ),
+    )
     layout = _layout_mhc_scratch(caps)
     return B12XMHCScratchPlan(
         caps=caps,
@@ -453,6 +479,8 @@ def plan_mhc_scratch(caps: B12XMHCScratchCaps) -> B12XMHCScratchPlan:
                 device=caps.device,
             ),
         ),
+        config=resolution.config,
+        policy_resolution=resolution,
     )
 
 
@@ -848,6 +876,42 @@ def _b12x_mhc_pre_impl(
     )
 
 
+
+_DEFAULT_MHC_PREFILL_MIN_TOKENS = 96
+_SM120_MHC_PREFILL_MIN_TOKENS = 192
+
+
+def _mhc_prefill_min_tokens_for_capability(
+    compute_capability: tuple[int, int] | None,
+) -> int:
+    """Padded row count from which the prefill mHC kernels replace the decode
+    partial kernel when no override is configured.
+
+    On SM120 (RTX PRO 6000 Blackwell) the four-way decode source split is
+    faster than the block-M prefill kernel up to 128 padded rows (96 rows:
+    33.6 vs 43.0 us; 128 rows: 41 vs 45 us) and slower from 192 rows
+    (57 vs 47 us, measured 2026-09-01 on GLM-5.3 hidden size 4096), so the
+    crossover moves from 96 to 192 rows there.
+    """
+    if compute_capability == (12, 0):
+        return _SM120_MHC_PREFILL_MIN_TOKENS
+    return _DEFAULT_MHC_PREFILL_MIN_TOKENS
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_prefill_min_tokens(device_index: int) -> int:
+    return _mhc_prefill_min_tokens_for_capability(
+        tuple(torch.cuda.get_device_capability(device_index))
+    )
+
+
+def _default_mhc_prefill_min_tokens(device: torch.device) -> int:
+    if device.type != "cuda":
+        return _DEFAULT_MHC_PREFILL_MIN_TOKENS
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _cuda_prefill_min_tokens(int(index))
+
+
 def _b12x_mhc_post_pre_impl(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -887,6 +951,7 @@ def _b12x_mhc_post_pre_impl(
         or comb_out is not None
     )
     partials = None
+    planned_config: MhcConfig | None = None
     if binding is not None:
         extras = [
             name
@@ -904,6 +969,7 @@ def _b12x_mhc_post_pre_impl(
                 f"do not also pass {', '.join(extras)}"
             )
         partials = binding.partials
+        planned_config = binding.plan.config
         residual_out = binding.out
         y_out = binding.y
         post_out = binding.post_buffer
@@ -1100,14 +1166,14 @@ def _b12x_mhc_post_pre_impl(
         # reference; Sinkhorn is ~0.015us/iter so the cost is negligible). The
         # Gram + RMSNorm are skipped when there is no fused norm_weight.
         from b12x.norm.mhc._kernels import (
-            run_mhc_finalize_gram,
             _selected_post_pre_decode_split_n,
+            mhc_prefill_tf32_project_splits,
+            run_mhc_finalize_gram,
             run_mhc_post_pre_functional,
             run_mhc_post_pre_partial,
             run_mhc_post_pre_prefill_block_m_partial,
             run_mhc_post_pre_prefill_gram,
             run_mhc_post_pre_prefill_partial,
-            mhc_prefill_tf32_project_splits,
             run_mhc_prefill_bf16_project,
             run_mhc_prefill_tf32_project,
         )
@@ -1132,12 +1198,24 @@ def _b12x_mhc_post_pre_impl(
             )
 
         prefill_min_tokens = int(
-            os.environ.get("B12X_MHC_PREFILL_MIN_TOKENS", "96")
+            os.environ.get(
+                "B12X_MHC_PREFILL_MIN_TOKENS",
+                str(_default_mhc_prefill_min_tokens(residual.device)),
+            )
         )
-        use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
-            norm_weight=norm_weight,
-            policy_m=policy_m,
-        )
+        if planned_config is not None:
+            tf32_enabled = planned_config.backend == "tf32_tma"
+            tf32_override = os.environ.get("B12X_MHC_PREFILL_TF32_MMA")
+            if tf32_override is None:
+                tf32_override = os.environ.get("B12X_MHC_PREFILL_BF16_MMA")
+            if tf32_override is not None:
+                tf32_enabled = tf32_override != "0"
+            use_prefill_tf32_mma = norm_weight is not None and tf32_enabled
+        else:
+            use_prefill_tf32_mma = _use_mhc_prefill_tf32_project(
+                norm_weight=norm_weight,
+                policy_m=policy_m,
+            )
         use_prefill_bf16_mma = (
             _use_mhc_prefill_bf16_project(
                 norm_weight=norm_weight,
@@ -1194,6 +1272,7 @@ def _b12x_mhc_post_pre_impl(
                 out=residual_out,
                 fn=fn,
                 partials=partials,
+                config=planned_config,
             )
         elif use_prefill_bf16_mma:
             run_mhc_post_pre_prefill_gram(
@@ -1243,6 +1322,11 @@ def _b12x_mhc_post_pre_impl(
                 partials=partials,
                 out=residual_out,
                 compute_gram=norm_weight is not None,
+                decode_partials_schedule=(
+                    planned_config.decode_partials_schedule
+                    if planned_config is not None
+                    else "default"
+                ),
             )
         run_mhc_finalize_gram(
             residual=residual_out,
@@ -1267,6 +1351,7 @@ def _b12x_mhc_post_pre_impl(
                 mhc_prefill_tf32_project_splits(
                     tokens=tokens,
                     hidden_size=hidden_size,
+                    config=planned_config,
                 )
                 if use_prefill_tf32_mma
                 else 1
