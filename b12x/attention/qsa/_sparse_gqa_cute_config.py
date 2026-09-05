@@ -8,12 +8,6 @@ HEAD_DIM = 256
 SELECTION_WIDTH = 2051
 BLOCK_N = 16
 NUM_SPLITS = 64
-SUPPORTED_HEAD_LAYOUTS = frozenset({(6, 1), (12, 1), (24, 2)})
-BENCHMARKED_ROW_LIMITS = {
-    (6, 1): 8,
-    (12, 1): 4,
-    (24, 2): 2,
-}
 
 
 def _is_page_token_head_layout(tensor: torch.Tensor) -> bool:
@@ -44,12 +38,17 @@ def is_qwen_geometry(
     splits: int,
 ) -> bool:
     """Return whether scalar dimensions select the Qwen sparse-GQA kernel."""
+    splits = int(splits)
     return (
-        (int(q_heads), int(kv_heads)) in SUPPORTED_HEAD_LAYOUTS
+        int(q_heads) > 0
+        and int(kv_heads) > 0
+        and int(q_heads) % int(kv_heads) == 0
         and int(head_dim) == HEAD_DIM
         and int(selection_width) == SELECTION_WIDTH
         and int(block_n) == BLOCK_N
-        and int(splits) == NUM_SPLITS
+        and splits > 0
+        and splits <= NUM_SPLITS
+        and splits & (splits - 1) == 0
     )
 
 
@@ -134,19 +133,17 @@ def is_candidate(
         and tuple(request_ids.shape) == (rows,)
         and tuple(query_positions.shape) == (rows,)
         and int(partial_output.shape[0]) >= rows
-        and tuple(partial_output.shape[1:]) == (NUM_SPLITS, q_heads, HEAD_DIM)
+        and tuple(partial_output.shape[1:]) == (int(splits), q_heads, HEAD_DIM)
         and int(partial_lse.shape[0]) >= rows
-        and tuple(partial_lse.shape[1:]) == (NUM_SPLITS, q_heads)
+        and tuple(partial_lse.shape[1:]) == (int(splits), q_heads)
     )
 
 
 __all__ = [
-    "BENCHMARKED_ROW_LIMITS",
     "BLOCK_N",
     "HEAD_DIM",
     "NUM_SPLITS",
     "SELECTION_WIDTH",
-    "SUPPORTED_HEAD_LAYOUTS",
     "is_candidate",
     "is_qwen_geometry",
 ]
