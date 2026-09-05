@@ -458,6 +458,56 @@ def threadfence_gpu(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def pcie_arrive_and_wait_acquire(
+    self_counter_addr: Int64,
+    peer_counter_slot0_addr: Int64,
+    wait_counter_slot0_addr: Int64,
+    slot_stride_bytes: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Barrier lane with acquire polling for peer-written payload visibility."""
+
+    llvm.inline_asm(
+        None,
+        [
+            Int64(self_counter_addr).ir_value(loc=loc, ip=ip),
+            Int64(peer_counter_slot0_addr).ir_value(loc=loc, ip=ip),
+            Int64(wait_counter_slot0_addr).ir_value(loc=loc, ip=ip),
+            Int64(slot_stride_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred done;
+            .reg .b32 val, seen, parity;
+            .reg .b64 slot_off, peer_addr, wait_addr;
+            fence.sc.sys;
+            ld.global.u32 val, [$0];
+            add.u32 val, val, 1;
+            st.global.u32 [$0], val;
+            and.b32 parity, val, 1;
+            cvt.u64.u32 slot_off, parity;
+            mul.lo.u64 slot_off, slot_off, $3;
+            add.u64 peer_addr, $1, slot_off;
+            add.u64 wait_addr, $2, slot_off;
+            st.relaxed.sys.global.u32 [peer_addr], val;
+        wait_again:
+            ld.acquire.sys.global.u32 seen, [wait_addr];
+            setp.eq.u32 done, seen, val;
+            @!done bra wait_again;
+        }
+        """,
+        "l,l,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def spin_until_changed_acquire_gpu(
     addr: Int64, generation: Uint32, *, loc=None, ip=None
 ) -> None:
