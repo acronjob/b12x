@@ -280,8 +280,9 @@ def _fake_m_for_specialization(size_m: int) -> int:
 
 
 # The W4A16 launch model chooses blocks/SM from static resource usage
-# for each specialization.  These register counts were measured from the local
-# SM121 JIT output and keep launch occupancy stable across refactors.
+# for each specialization. Most entries are measured from the local SM121 JIT
+# output; conservative caps keep supported intermediate route tiles launchable
+# when their exact count cannot change the resulting occupancy.
 _W4A16_REGS_SM121 = {
     (256, 1, 8, 8, True): 118,
     (256, 1, 16, 4, True): 118,
@@ -290,6 +291,10 @@ _W4A16_REGS_SM121 = {
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
     (256, 1, 8, 8, False): 158,
+    # The wide-N single-route tile is already above the one-CTA/SM register
+    # threshold in the narrower N=128 schedule. The architectural cap keeps
+    # the same launch contract until this specialization is measured directly.
+    (256, 1, 16, 4, False): 255,
     (128, 1, 4, 8, False): 154,
     (128, 1, 8, 4, False): 143,
     (256, 2, 16, 4, False): 212,
@@ -299,6 +304,10 @@ _W4A16_REGS_SM121 = {
     # FC2 keeps the paired-M8 schedule qualified by mixed_trellis.py.
     (256, 2, 8, 8, False): 175,
     (256, 3, 16, 4, False): 249,
+    # Block-48 is already above the one-CTA/SM register threshold at block-32.
+    # Use the architectural cap until it has its own measured resource entry;
+    # both values produce the same one-CTA/SM launch contract.
+    (256, 3, 8, 8, False): 255,
     (128, 3, 4, 8, False): 249,
     (128, 3, 8, 4, False): 250,
     (256, 4, 16, 4, False): 255,
@@ -11612,6 +11621,7 @@ def run_w4a16_moe(
     svh_table: torch.Tensor | None = None,
     rotation_a_gate: torch.Tensor | None = None,
     rotation_a_up: torch.Tensor | None = None,
+    route_mode: str = "auto",
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -11623,6 +11633,9 @@ def run_w4a16_moe(
         swiglu_beta,
     )
     full_rotation = bool(full_rotation)
+    route_mode = str(route_mode).lower()
+    if route_mode not in {"auto", "direct", "packed"}:
+        raise ValueError("W4A16 route_mode must be 'auto', 'direct', or 'packed'")
     rotation_input_dtype = _normalize_element_dtype(a_input.dtype)
     prepared_dtype = getattr(prepared, "params_dtype", a_input.dtype)
     if full_rotation:
@@ -11923,22 +11936,26 @@ def run_w4a16_moe(
     sms = int(props.multi_processor_count)
     current_stream = current_cuda_stream()
     stream = current_stream if stream is None else stream
-    if (not collect_activation_amax) and _small_m_direct_supported(
-        m=m,
-        hidden_size=hidden_size,
-        intermediate_size=int(prepared.intermediate_size),
-        num_experts=int(prepared.num_experts),
-        topk=topk,
-        activation=activation,
-        apply_router_weight_on_input=bool(apply_router_weight_on_input),
-        swiglu_limit=swiglu_limit,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        element_dtype=element_dtype,
-        weight_layout=weight_layout,
-        w13_layout=w13_layout,
-        scale_format=scale_format,
-        expert_map=expert_map,
+    if (
+        route_mode != "packed"
+        and (not collect_activation_amax)
+        and _small_m_direct_supported(
+            m=m,
+            hidden_size=hidden_size,
+            intermediate_size=int(prepared.intermediate_size),
+            num_experts=int(prepared.num_experts),
+            topk=topk,
+            activation=activation,
+            apply_router_weight_on_input=bool(apply_router_weight_on_input),
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            element_dtype=element_dtype,
+            weight_layout=weight_layout,
+            w13_layout=w13_layout,
+            scale_format=scale_format,
+            expert_map=expert_map,
+        )
     ):
         if topk_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("W4A16 small-M direct path requires int32/int64 topk_ids")
@@ -12020,20 +12037,25 @@ def run_w4a16_moe(
     # ``tc_decode_fused_sum``; accept it through the binding path. A runtime
     # ``fused_launch is None`` (e.g. the standalone benchmark) compiles its own.
     preplanned_tc_decode = bool(getattr(fused_launch, "tc_decode_fused_sum", False))
-    use_tc_decode = bool(
-        (not collect_activation_amax)
-        and (fused_launch is None or preplanned_tc_decode)
-        and weight_layout == "packed"
-        and is_gated
-        and element_dtype == "bf16"
-        and topk_ids.dtype in (torch.int32, torch.int64)
-        and topk_ids.is_cuda
+    prefer_tc_decode = route_mode == "direct" or (
+        route_mode == "auto"
         and _w4a16_tc_decode_preferred(
             m=m,
             topk=topk,
             num_experts=int(prepared.num_experts),
             sms=sms,
         )
+    )
+    use_tc_decode = bool(
+        (not collect_activation_amax)
+        and route_mode != "packed"
+        and (fused_launch is None or preplanned_tc_decode)
+        and weight_layout == "packed"
+        and is_gated
+        and element_dtype == "bf16"
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and topk_ids.is_cuda
+        and prefer_tc_decode
     )
     if use_tc_decode and topk_ids.dtype != torch.int32:
         # The inline direct-topk route path needs int32 route indices.
@@ -12048,6 +12070,7 @@ def run_w4a16_moe(
     )
     direct_topk_eligible = (
         (not collect_activation_amax)
+        and route_mode != "packed"
         and (m <= direct_m_cap or use_tc_decode)
         and direct_layout_ok
     )
@@ -12075,6 +12098,11 @@ def run_w4a16_moe(
 
     # TC-decode requires the inline direct-topk route path (no route-pack).
     use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
+
+    if route_mode == "direct" and not use_direct_topk_routes:
+        raise RuntimeError(
+            "planned W4A16 direct routing is unsupported for this launch shape"
+        )
 
     # A preplanned TC-decode launch atomically accumulates FC2 partials into the
     # (pre-zeroed) output and emits no separate top-k sum. If it was selected but

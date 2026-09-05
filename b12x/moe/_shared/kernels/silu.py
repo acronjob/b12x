@@ -81,11 +81,13 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         deterministic_output: bool = False,
         num_topk: int = 1,
         swap_ab: bool = False,
+        separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         direct_routing: bool = False,
+        external_route_plan: bool = False,
         work_source: str = "materialized_queue",
         materialize_intermediate: bool = False,
         swiglu_limit: float | None = None,
@@ -93,6 +95,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
         swiglu_beta: float | None = None,
         mxfp6_fmt_a: str | None = None,
         mxfp6_fmt_b: str | None = None,
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         super().__init__(
             sf_vec_size,
@@ -104,11 +108,13 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             deterministic_output=deterministic_output,
             num_topk=num_topk,
             swap_ab=swap_ab,
+            separate_w13_halves=separate_w13_halves,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
             trellis_bits=trellis_bits,
             trellis_coupled=trellis_coupled,
             direct_routing=direct_routing,
+            external_route_plan=external_route_plan,
             work_source=work_source,
             materialize_intermediate=materialize_intermediate,
             swiglu_limit=swiglu_limit,
@@ -116,6 +122,8 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
             swiglu_beta=swiglu_beta,
             mxfp6_fmt_a=mxfp6_fmt_a,
             mxfp6_fmt_b=mxfp6_fmt_b,
+            split_phase=split_phase,
+            low_smem_pipeline=low_smem_pipeline,
         )
 
 
@@ -185,6 +193,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
         deterministic_output: bool = False,
         num_topk: int = 1,
         swap_ab: bool = False,
+        separate_w13_halves: bool = False,
         quant_recipe: str = "nvfp4",
         w4a8_repacked: bool = False,
         direct_routing: bool = False,
@@ -193,6 +202,8 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
         swiglu_beta: float | None = None,
+        split_phase: str = "fused",
+        low_smem_pipeline: bool = False,
     ):
         activation = SWIGLUOAI_UNINTERLEAVE
         super().__init__(
@@ -205,6 +216,7 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
             deterministic_output=deterministic_output,
             num_topk=num_topk,
             swap_ab=swap_ab,
+            separate_w13_halves=separate_w13_halves,
             quant_recipe=quant_recipe,
             w4a8_repacked=w4a8_repacked,
             direct_routing=direct_routing,
@@ -217,6 +229,8 @@ class MoEDynamicKernelSwiGLUOAI(MoEDynamicKernelBackend):
                 activation, swiglu_alpha
             ),
             swiglu_beta=normalize_swiglu_beta_for_activation(activation, swiglu_beta),
+            split_phase=split_phase,
+            low_smem_pipeline=low_smem_pipeline,
         )
 
 
