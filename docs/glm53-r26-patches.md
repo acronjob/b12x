@@ -1,5 +1,8 @@
 # GLM-5.3 Flash R26 serving patches
 
+**This checkout is the experimental branch. These notes describe its serving
+base; see [experimental scope and limits](glm53-r26-experiments.md).**
+
 This branch preserves the source-locked R26 integration and the local patches
 used in the validated runtime. Use the matching `patches/r26-serving-20260905`
 branch in both `acronjob/vllm` and `acronjob/b12x`.

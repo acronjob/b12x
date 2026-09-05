@@ -1,0 +1,15 @@
+{
+  "base_branch": "patches/r26-serving-20260905",
+  "format": "glm53-r26-source-export/v1",
+  "paired_branch": "patches/r26-experimental-20260905",
+  "serving_qualified": false,
+  "source_files": [
+    {
+      "base_sha256": "7588bd21a679c02e7952657d90dfbda7861add720e14d44b9396ce7ad6e2ee58",
+      "change": "dcp-pooled-decode",
+      "path": "b12x/attention/sparse_mla/pooled_selection.py",
+      "project": "b12x",
+      "sha256": "09f1ba95d351c201c43139322b3468c0f31c8a7e0a1394935af703eca3d21028"
+    }
+  ]
+}

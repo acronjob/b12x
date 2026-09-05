@@ -163,3 +163,92 @@ def expand_pooled_topk_to_physical_slots(
 
 
 __all__ = ["expand_pooled_topk_to_physical_slots"]
+
+
+# Default-off R26 DCP selection experiment.
+@triton.jit
+def _expand_dcp_pools(
+    pools, positions, requests, table, output, counts,
+    pool_stride, table_stride0, table_stride1, output_stride,
+    max_blocks, num_cache_blocks,
+    DCP_SIZE: tl.constexpr, DCP_RANK: tl.constexpr,
+    INTERLEAVE: tl.constexpr, PAGE_SIZE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    p = tl.arange(0, 512)
+    pool = tl.load(pools + row * pool_stride + p).to(tl.int64)
+    token = pool * 4
+    local = (token // (DCP_SIZE * INTERLEAVE)) * INTERLEAVE + token % INTERLEAVE
+    owner = (token // INTERLEAVE) % DCP_SIZE
+    block = local // PAGE_SIZE
+    request = tl.load(requests + row).to(tl.int64)
+    valid = (pool >= 0) & (owner == DCP_RANK) & (block >= 0) & (block < max_blocks)
+    page = tl.load(table + request * table_stride0 + block * table_stride1,
+                   mask=valid, other=-1).to(tl.int64)
+    valid &= (page >= 0) & (page < num_cache_blocks)
+    physical = page * PAGE_STRIDE + local % PAGE_SIZE
+    flags = valid.to(tl.int32)
+    offsets = (tl.cumsum(flags) - flags) * 4
+    history_count = tl.sum(flags) * 4
+
+    seq = tl.load(positions + row).to(tl.int64) + 1
+    tail_start = (seq // 4) * 4
+    tail_local = (tail_start // (DCP_SIZE * INTERLEAVE)) * INTERLEAVE + tail_start % INTERLEAVE
+    tail_block = tail_local // PAGE_SIZE
+    tail_valid = (seq > 0) & ((tail_start // INTERLEAVE) % DCP_SIZE == DCP_RANK)
+    tail_valid &= (tail_block >= 0) & (tail_block < max_blocks)
+    tail_page = tl.load(table + request * table_stride0 + tail_block * table_stride1,
+                        mask=tail_valid, other=-1).to(tl.int64)
+    tail_valid &= (tail_page >= 0) & (tail_page < num_cache_blocks)
+    tail_count = tl.where(tail_valid, seq % 4, 0).to(tl.int32)
+    active = history_count + tail_count
+
+    # The invalid suffix and compact valid prefix have disjoint destinations.
+    columns = tl.arange(0, 4096)
+    tl.store(output + row * output_stride + columns, -1,
+             mask=(columns < 2051) & (columns >= active))
+    inner = tl.arange(0, 4)
+    tl.store(output + row * output_stride + offsets[:, None] + inner[None, :],
+             (physical[:, None] + inner[None, :]).to(tl.int32),
+             mask=valid[:, None])
+    tl.store(output + row * output_stride + history_count + inner,
+             (tail_page * PAGE_STRIDE + tail_local % PAGE_SIZE + inner).to(tl.int32),
+             mask=inner < tail_count)
+    tl.store(counts + row, active)
+
+
+def expand_dcp_pools(pools, positions, requests, table, output, counts, *,
+                     dcp_size, dcp_rank, interleave, page_size,
+                     page_stride, num_cache_blocks):
+    """Write a compact stable prefix without allocating any tensor storage."""
+    rows = pools.shape[0]
+    if pools.shape != (rows, 512) or output.shape != (rows, 2051):
+        raise ValueError("expected C4 selection shapes [rows,512] and [rows,2051]")
+    if positions.shape != (rows,) or requests.shape != (rows,) or counts.shape != (rows,):
+        raise ValueError("expected one metadata entry per row")
+    if table.ndim != 2 or min(table.shape) < 1:
+        raise ValueError("expected a nonempty request page table")
+    if dcp_size not in (1, 2, 4) or not 0 <= dcp_rank < dcp_size:
+        raise ValueError("unsupported DCP geometry")
+    if page_size < 1 or interleave < 4 or interleave % 4 or page_size % interleave:
+        raise ValueError("C4 ownership must align to pages and interleave groups")
+    if page_stride < page_size or num_cache_blocks < 1:
+        raise ValueError("invalid page geometry")
+    if (num_cache_blocks - 1) * page_stride + page_size - 1 > 2**31 - 1:
+        raise ValueError("physical slot IDs exceed the int32 ABI")
+    metadata = (pools, requests, table, output, counts)
+    if any(x.dtype != torch.int32 for x in metadata) or positions.dtype != torch.int64:
+        raise TypeError("selection metadata must be int32; positions must be int64")
+    if any(x.device != pools.device for x in (*metadata, positions)):
+        raise ValueError("all tensors must share one device")
+    if any(not x.is_contiguous() for x in (pools, positions, requests, output, counts)):
+        raise ValueError("selection arrays must be contiguous")
+    if rows:
+        _expand_dcp_pools[(rows,)](
+            pools, positions, requests, table, output, counts,
+            pools.stride(0), table.stride(0), table.stride(1), output.stride(0),
+            table.shape[1], num_cache_blocks,
+            DCP_SIZE=dcp_size, DCP_RANK=dcp_rank, INTERLEAVE=interleave,
+            PAGE_SIZE=page_size, PAGE_STRIDE=page_stride, num_warps=4,
+        )
