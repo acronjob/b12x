@@ -1,0 +1,29 @@
+{
+  "enable_env": {
+    "B12X_PCIE_PLAIN_TP4_REMOTE_PUSH": "1",
+    "VLLM_GLM53_MHC_TOKEN_SHARD": "1"
+  },
+  "format": "glm53-r26-source-export/v1",
+  "image": "voipmonitor/vllm:jovian-judgement-community-20260905-r26@sha256:d0592ea9d73cac5aadb151a58bbb43cf7aff03829d46bb4f4ba7396aaef67c68",
+  "paired_branch": "patches/r26-serving-20260905",
+  "project": "b12x",
+  "qualification": "Exact overlay sources were tested in R26; a new repository build is not qualified.",
+  "source_files": [
+    {
+      "change": "decode-push",
+      "path": "b12x/comm/pcie/_cute_intrinsics.py",
+      "sha256": "cbe475dc4c01d13a755793cd3941cfe5e1a3b154819203aeb6a591a9fb1f35a9"
+    },
+    {
+      "change": "decode-push",
+      "path": "b12x/comm/pcie/_oneshot_cute.py",
+      "sha256": "6dba46d605d4f0ba0d2423bf05165cbde87815626d274b733c3290d1d70571d9"
+    },
+    {
+      "change": "decode-push",
+      "path": "b12x/comm/pcie/pcie_oneshot.py",
+      "sha256": "15bd2614a3777ee63c50e9c71d70059440c84abbba78391a132320b947a0ac15"
+    }
+  ],
+  "vllm_upstream_commit": "3512b066e7796128c0c380ccc558182960f2f0ea"
+}

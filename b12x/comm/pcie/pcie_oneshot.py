@@ -132,23 +132,29 @@ def _tp8_owner_reduce_enabled() -> bool:
     return os.getenv("B12X_PCIE_TP8_OWNER_REDUCE", "1") not in ("", "0")
 
 
+def _plain_tp4_remote_push_enabled() -> bool:
+    """Enable the qualified plain TP4 remote-write transport."""
+
+    return os.getenv("B12X_PCIE_PLAIN_TP4_REMOTE_PUSH", "0") not in ("", "0")
+
+
 def _uses_sharded_eager_storage(
     world_size: int,
-    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+    transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
 ) -> bool:
     """Return whether staged fused transport needs one shard per source."""
 
-    push, tp2_remote, tp4_remote, tp8_owner = (
+    push, tp2_remote, tp4_remote, tp8_owner, plain_tp4_remote = (
         _transport_policy_contract() if transport_policy is None else transport_policy
     )
     return push or (
         (world_size == 2 and tp2_remote)
-        or (world_size == 4 and tp4_remote)
+        or (world_size == 4 and (tp4_remote or plain_tp4_remote))
         or (world_size == 8 and tp8_owner)
     )
 
 
-def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
+def _transport_policy_contract() -> tuple[bool, bool, bool, bool, bool]:
     """Values that must agree across ranks before IPC storage is allocated."""
 
     return (
@@ -156,6 +162,7 @@ def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
         _tp2_remote_push_enabled(),
         _tp4_remote_push_enabled(),
         _tp8_owner_reduce_enabled(),
+        _plain_tp4_remote_push_enabled(),
     )
 
 
@@ -1253,7 +1260,13 @@ class _CuTeOneshotState:
     eager_tables: Optional[tuple[int, int]] = None
     eager_ptrs: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
     eager_buffer_bytes: Optional[int] = None
-    transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
+    transport_policy: tuple[bool, bool, bool, bool, bool] = (
+        False,
+        False,
+        False,
+        False,
+        False,
+    )
     sharded_eager_storage: bool = False
     eager_slot: int = 0
     device_slot_selection: bool = False
@@ -1367,7 +1380,7 @@ class _CuTeOneshotBackend:
         pointers0: Sequence[int],
         pointers1: Sequence[int],
         eager_buffer_bytes: Optional[int] = None,
-        transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+        transport_policy: Optional[tuple[bool, bool, bool, bool, bool]] = None,
     ) -> None:
         state = self._state(handle)
         ptrs0 = tuple(int(pointer) for pointer in pointers0)
@@ -1427,7 +1440,7 @@ class _CuTeOneshotBackend:
         if hidden <= 0 or inp.numel() % hidden != 0:
             return None
         rows = inp.numel() // hidden
-        _, tp2_remote, tp4_remote, tp8_owner = state.transport_policy
+        _, tp2_remote, tp4_remote, tp8_owner, _ = state.transport_policy
         if (
             state.world_size == 8
             and tp8_owner
@@ -1445,6 +1458,31 @@ class _CuTeOneshotBackend:
         if state.world_size == 2 and tp2_remote and hidden == 4096 and 1 <= rows <= 32:
             return "stage_remote_push"
         return None
+
+    @staticmethod
+    def _plain_topology_mode(
+        state: _CuTeOneshotState,
+        inp: torch.Tensor,
+    ) -> str:
+        """Select the plain all-reduce transport with a qualified shape contract."""
+
+        if state.eager_tables is None:
+            return "registered"
+        _, _, _, _, plain_tp4_remote = state.transport_policy
+        if (
+            plain_tp4_remote
+            and state.sharded_eager_storage
+            and state.eager_buffer_bytes is not None
+            and state.world_size == 4
+            and inp.dtype in (torch.float16, torch.bfloat16)
+            and inp.ndim > 0
+        ):
+            hidden = int(inp.shape[-1])
+            if hidden > 0 and inp.numel() % hidden == 0:
+                rows = inp.numel() // hidden
+                if hidden in (4096, 6144) and 4 <= rows <= 16:
+                    return "stage_remote_push"
+        return "stage_pull"
 
     @classmethod
     def _fused_launch_config(
@@ -1487,7 +1525,8 @@ class _CuTeOneshotBackend:
         """Compile/load every graph slot variant without launching a kernel."""
 
         state = self._state(handle)
-        stage_input = state.eager_tables is not None
+        mode = self._plain_topology_mode(state, inp)
+        stage_input = mode != "registered"
         if not stage_input and int(inp.data_ptr()) not in state.registered_tables:
             raise RuntimeError("input buffer is not registered")
         threads, _ = self._launch_geometry(inp.numel() * inp.element_size() // 16)
@@ -1500,6 +1539,7 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
+                mode,
                 stage_input,
                 device_slot_selection,
                 slot_bias,
@@ -1570,9 +1610,11 @@ class _CuTeOneshotBackend:
         capturing = _is_current_stream_capturing(inp.device)
         size_packs = inp.numel() * inp.element_size() // 16
         threads, blocks = self._launch_geometry(size_packs)
+        mode = self._plain_topology_mode(state, inp)
+        stage_input = mode != "registered"
         device_index = self._device_index(inp.device)
         prospective_device_selection = state.device_slot_selection or (
-            capturing and state.eager_tables is not None
+            capturing and stage_input
         )
         prospective_slot_bias = (
             state.slot_bias if state.device_slot_selection else state.eager_slot & 1
@@ -1584,7 +1626,8 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
-                state.eager_tables is not None,
+                mode,
+                stage_input,
                 prospective_device_selection,
                 prospective_slot_bias,
                 threads,
@@ -1596,7 +1639,7 @@ class _CuTeOneshotBackend:
                 )
         if (
             capturing
-            and state.eager_tables is not None
+            and stage_input
             and not state.device_slot_selection
         ):
             # The graph epoch begins at zero.  Bias it to the host slot that
@@ -1611,6 +1654,7 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
+                mode,
                 stage_input,
                 state.device_slot_selection,
                 state.slot_bias,
@@ -1625,6 +1669,7 @@ class _CuTeOneshotBackend:
                         _dtype_name(inp.dtype),
                         state.world_size,
                         state.rank,
+                        mode,
                         stage_input,
                         True,
                         slot_bias,
@@ -1637,6 +1682,7 @@ class _CuTeOneshotBackend:
                 inp.data_ptr(),
                 out.data_ptr(),
                 size_packs,
+                int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 blocks,
             )
 
@@ -2042,7 +2088,7 @@ class PCIeOneshotAllReduce:
         eager_buffer_ptrs0: Optional[Sequence[int]],
         eager_buffer_ptrs1: Optional[Sequence[int]],
         eager_buffer_bytes: Optional[int],
-        transport_policy: tuple[bool, bool, bool, bool],
+        transport_policy: tuple[bool, bool, bool, bool, bool],
         exchange_group: Optional[ProcessGroup],
         ipc: Optional[CudaRTLibrary],
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]],
